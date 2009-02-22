@@ -1,10 +1,12 @@
+require 'eventmachine'
+require 'evma_xmlpushparser'
 require 'libxml'
 
 require 'xmpp4r/jid'
 require 'rexml/document'
 require 'xmpp4r/sasl'
 
-require 'em'
+EM.epoll
 
 module XMPP4EM
   class NotConnected < Exception; end
@@ -45,8 +47,7 @@ module XMPP4EM
       if @current_node.nil?
         @current_node = node
         # assign the node to a document so XPath works
-        @doc = XML::Document.new
-        @doc.root = @current_node
+        XML::Document.new.root = @current_node
       else
         @current_node = @current_node.child_add(node)
       end
@@ -203,16 +204,18 @@ module XMPP4EM
     end
 
     def send_msg(to, msg)
-      send Jabber::Message::new(to, msg).set_type(:chat)
+      send(message(to, msg, :chat))
+    end
+
+    def send_presence(status = nil, to = nil)
+      send(presence(status, to))
     end
 
     def send(data, &blk)
       raise NotConnected unless connected?
 
       if block_given?
-        if data.attributes['id'].nil?
-          data.attributes['id'] = generate_id
-        end
+        data.attributes['id'] ||= generate_id
 
         @id_callbacks[ data.attributes['id'] ] = blk
       end
@@ -274,8 +277,6 @@ module XMPP4EM
           end
         end
 
-        return
-
       when 'success', 'failure'
         if stanza.name == 'success'
           @authenticated = true
@@ -327,6 +328,21 @@ module XMPP4EM
       XML::Namespace.new(iq, nil, "jabber:client")
       XML::Attr.new(iq, "type", type.to_s)
       iq
+    end
+
+    def message(to, msg, type)
+      message = XML::Node.new("message")
+      XML::Namespace.new(message, nil, "jabber:client")
+      XML::Attr.new(message, "to", to.to_s)
+      XML::Attr.new(message, "type", type.to_s)
+      message << XML::Node.new("body", msg)
+    end
+
+    def presence(status = nil, to = nil)
+      presence = XML::Node.new("presence")
+      XML::Namespace.new(presence, nil, "jabber:client")
+      XML::Attr.nil(presence, "to", to.to_s) if to
+      presence << XML::Node.new("status", status.to_s) if status
     end
   end
 end
