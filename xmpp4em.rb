@@ -1,13 +1,7 @@
-require 'stringio'
-require 'rexml/parsers/sax2parser'
+require 'libxml'
 
-require 'rubygems'
-
-require 'xmpp4r/idgenerator'
-require 'xmpp4r/xmppstanza'
-require 'xmpp4r/iq'
-require 'xmpp4r/message'
-require 'xmpp4r/presence'
+require 'xmpp4r/jid'
+require 'rexml/document'
 require 'xmpp4r/sasl'
 
 require 'em'
@@ -16,7 +10,9 @@ module XMPP4EM
   class NotConnected < Exception; end
 
   class Connection < EventMachine::Connection
-    def initialize host, port
+    include LibXML
+
+    def initialize(host, port)
       @host, @port = host, port
       @client = nil
     end
@@ -32,46 +28,63 @@ module XMPP4EM
 
     include EventMachine::XmlPushParser
 
-    def start_element name, attrs
-      e = REXML::Element.new(name)
-      e.add_attributes attrs
-      
-      @current = @current.nil? ? e : @current.add_element(e)
+    def start_element(name, attrs)
+      node = XML::Node.new(name)
+      attrs.each do |k,v|
+        if k =~ /^xmlns:?(\w*)/
+          if $1 != ""
+            XML::Namespace.new(node, $1, v)
+          else
+            XML::Namespace.new(node, nil, v)
+          end
+        else
+          XML::Attr.new(node, k, v)
+        end
+      end
 
-      if @current.name == 'stream' and not @started
+      if @current_node.nil?
+        @current_node = node
+        # assign the node to a document so XPath works
+        @doc = XML::Document.new
+        @doc.root = @current_node
+      else
+        @current_node = @current_node.child_add(node)
+      end
+
+      if @current_node.name == 'stream:stream' and not @started
         @started = true
         process
-        @current = nil
+        @current_node = nil
       end
     end
-    
-    def end_element name
-      if name == 'stream:stream' and @current.nil?
+
+    def end_element(name)
+      if name == 'stream:stream' and @current_node.nil?
         @started = false
       else
-        if @current.parent
-          @current = @current.parent
+        if @current_node.parent && @current_node.parent.is_a?(XML::Node)
+          @current_node = @current_node.parent
         else
           process
-          @current = nil
+          @current_node = nil
         end
       end
     end
 
-    def characters text
-      @current.text = @current.text.to_s + text if @current
+    def characters(text)
+      @current_node.content += text if @current_node
     end
 
-    def error *args
+    def error(*args)
       p ['error', *args]
     end
 
-    def receive_data data
+    def receive_data(data)
       log "<< #{data}"
       super
     end
 
-    def send data, &blk
+    def send(data, &blk)
       log ">> #{data}"
       send_data data.to_s
     end
@@ -85,7 +98,7 @@ module XMPP4EM
       log 'disconnected'
     end
 
-    def reconnect host = @host, port = @port
+    def reconnect(host = @host, port = @port)
       super
     end
 
@@ -95,63 +108,40 @@ module XMPP4EM
       send "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' xml:lang='en' version='1.0' to='#{@host}'>"
     end
 
-    private
+  private
 
-    def log data
+    def log(data)
       return
       puts
       puts data
     end
 
     def process
-      if @current.namespace('').to_s == '' # REXML namespaces are always strings
-        @current.add_namespace(@streamns)
-      end
-
-      case @current.prefix
-      when 'stream'
-
-        case @current.name
-          when 'stream'
-            @streamid = @current.attributes['id']
-            @streamns = @current.namespace('') if @current.namespace('')
-
-            # Hack: component streams are basically client streams.
-            # Someday we may want to create special stanza classes
-            # for components/s2s deriving from normal stanzas but
-            # posessing these namespaces
-            @streamns = 'jabber:client' if @streamns == 'jabber:component:accept'
-
-          when 'features'
-            @stream_features, @stream_mechanisms = {}, []
-            @current.each { |e|
-              if e.name == 'mechanisms' and e.namespace == 'urn:ietf:params:xml:ns:xmpp-sasl'
-                e.each_element('mechanism') { |mech|
-                  @stream_mechanisms.push(mech.text)
-                }
-              else
-                @stream_features[e.name] = e.namespace
-              end
-            }
-        end
-
-        stanza = @current
-
-      else
-        # Any stanza, classes are registered by XMPPElement::name_xmlns
-        begin
-          stanza = Jabber::XMPPStanza::import(@current)
-        rescue Jabber::NoNameXmlnsRegistered
-          stanza = @current
+      case @current_node.name
+      when 'stream:stream'
+        @streamid = @current_node.attributes['id']
+      when 'stream:features'
+        @stream_features, @stream_mechanisms = {}, []
+        @current_node.each_element do |e|
+          if e.name == 'mechanisms' and e.namespaces.default.href == 'urn:ietf:params:xml:ns:xmpp-sasl'
+            e.each_element do |mech|
+              next unless mech.name == 'mechanism'
+              @stream_mechanisms.push(mech.content)
+            end
+          else
+            @stream_features[e.name] = e.namespaces.default.href
+          end
         end
       end
 
-      @client.receive(stanza)
+      @client.receive(@current_node)
     end
   end
 
   class Client
-    def initialize user, pass, opts = {}
+    include LibXML
+
+    def initialize(user, pass, opts = {})
       @user = user
       @pass = pass
       @connection = nil
@@ -181,7 +171,7 @@ module XMPP4EM
                end
     end
 
-    def connect host = jid.domain, port = 5222
+    def connect(host = jid.domain, port = 5222)
       EM.run {
         EM.connect host, port, Connection, host, port do |conn|
           @connection = conn
@@ -198,33 +188,33 @@ module XMPP4EM
       @connection and !@connection.error?
     end
 
-    def login &blk
+    def login(&blk)
       Jabber::SASL::new(self, 'PLAIN').auth(@pass)
       @auth_callback = blk if block_given?
     end
 
-    def register &blk
+    def register(&blk)
       reg = Jabber::Iq.new_register(jid.node, @pass)
       reg.to = jid.domain
-      
+
       send(reg){ |reply|
         blk.call( reply.type == :result ? :success : reply.type )
       }
     end
 
-    def send_msg to, msg
+    def send_msg(to, msg)
       send Jabber::Message::new(to, msg).set_type(:chat)
     end
 
-    def send data, &blk
+    def send(data, &blk)
       raise NotConnected unless connected?
 
-      if block_given? and data.is_a? Jabber::XMPPStanza
-        if data.id.nil?
-          data.id = Jabber::IdGenerator.instance.generate_id
+      if block_given?
+        if data.attributes['id'].nil?
+          data.attributes['id'] = generate_id
         end
 
-        @id_callbacks[ data.id ] = blk
+        @id_callbacks[ data.attributes['id'] ] = blk
       end
 
       @connection.send(data)
@@ -236,15 +226,15 @@ module XMPP4EM
     end
     alias :disconnect :close
 
-    def receive stanza
-      if stanza.kind_of? Jabber::XMPPStanza and stanza.id and blk = @id_callbacks[ stanza.id ]
-        @id_callbacks.delete stanza.id
+    def receive(stanza)
+      if stanza.attributes["id"] && blk = @id_callbacks[stanza.attributes["id"]]
+        @id_callbacks.delete stanza.attributes["id"]
         blk.call(stanza)
         return
       end
 
       case stanza.name
-      when 'features'
+      when 'stream:features'
         unless @authenticated
           login do |res|
             # log ['login response', res].inspect
@@ -258,25 +248,25 @@ module XMPP4EM
 
         else
           if @connection.stream_features.has_key? 'bind'
-            iq = Jabber::Iq.new(:set)
-            bind = iq.add REXML::Element.new('bind')
-            bind.add_namespace @connection.stream_features['bind']
+            iq = iq(:set)
+            bind = iq.child_add(XML::Node.new("bind"))
+            XML::Namespace.new(bind, nil, @connection.stream_features['bind'])
 
             send(iq){ |reply|
-              if reply.type == :result and jid = reply.first_element('//jid') and jid.text
-                # log ['new jid is', jid.text].inspect
-                @jid = Jabber::JID.new(jid.text)
+              if reply.attributes["type"] == "result" and jid = reply.find_first('//jid') and jid.content
+                p ['new jid is', jid.content].inspect
+                @jid = Jabber::JID.new(jid.content)
               end
             }
           end
 
           if @connection.stream_features.has_key? 'session'
-            iq = Jabber::Iq.new(:set)
-            session = iq.add REXML::Element.new('session')
-            session.add_namespace @connection.stream_features['session']
+            iq = iq(:set)
+            session = iq.child_add(XML::Node.new("session"))
+            XML::Namespace.new(session, nil, @connection.stream_features['session'])
 
             send(iq){ |reply|
-              if reply.type == :result
+              if reply.attributes["type"] == "result"
 
                 on(:login, stanza)
               end
@@ -295,22 +285,19 @@ module XMPP4EM
 
         @auth_callback.call(stanza.name.to_sym) if @auth_callback
         return
-      end
 
-      case stanza
-      when Jabber::Message
+      when 'message'
         on(:message, stanza)
 
-      when Jabber::Iq
+      when 'iq'
         on(:iq, stanza)
 
-      when Jabber::Presence
+      when 'presence'
         on(:presence, stanza)
       end
-
     end
-    
-    def on type, *args, &blk
+
+    def on(type, *args, &blk)
       if blk
         @callbacks[type] << blk
       else
@@ -319,10 +306,27 @@ module XMPP4EM
         end
       end
     end
-    
+
     def add_message_callback  (&blk) on :message,   &blk end
     def add_presence_callback (&blk) on :presence,  &blk end
     def add_iq_callback       (&blk) on :iq,        &blk end
     def on_exception          (&blk) on :exception, &blk end
+
+  protected
+
+    def generate_id
+      @last_id ||= 0
+      @last_id += 1
+      timefrac = Time.new.to_f.to_s.split(/\./, 2).last[-3..-1]
+
+      "#{@last_id}#{timefrac}"
+    end
+
+    def iq(type)
+      iq = XML::Node.new("iq")
+      XML::Namespace.new(iq, nil, "jabber:client")
+      XML::Attr.new(iq, "type", type.to_s)
+      iq
+    end
   end
 end
