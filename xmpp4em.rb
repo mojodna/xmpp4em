@@ -151,8 +151,70 @@ module XMPP4EM
     end
   end
 
+  DefaultIqHandler = lambda do |stanza, client|
+    client.on(:iq, stanza)
+  end
+
+  DefaultMessageHandler = lambda do |stanza, client|
+    client.on(:message, stanza)
+  end
+
+  DefaultPresenceHandler = lambda do |stanza, client|
+    client.on(:presence, stanza)
+  end
+
+  AuthHandler = lambda do |stanza, client|
+    include LibXML
+
+    unless client.authenticated?
+      puts "logging in..."
+      client.login do |res|
+        p ['login response', res].inspect
+        if res == :failure and @opts[:auto_register]
+          register do |res|
+            p ['register response', res]
+            login unless res == :error
+          end
+        end
+      end
+    else
+      if client.connection.stream_features.has_key? 'bind'
+        iq = client.iq(:set)
+        bind = iq.child_add(XML::Node.new("bind"))
+        XML::Namespace.new(bind, nil, client.connection.stream_features['bind'])
+
+        client.send (iq) { |reply|
+          if reply.attributes["type"] == "result" and jid = reply.find_first('//jid') and jid.content
+            p ['new jid is', jid.content].inspect
+            client.jid = Jabber::JID.new(jid.content)
+          end
+        }
+      end
+
+      if client.connection.stream_features.has_key? 'session'
+        iq = client.iq(:set)
+        session = iq.child_add(XML::Node.new("session"))
+        XML::Namespace.new(session, nil, client.connection.stream_features['session'])
+
+        client.send (iq) { |reply|
+          if reply.attributes["type"] == "result"
+
+            client.on(:login, reply)
+          end
+        }
+      end
+    end
+  end
+
   class Client
     include LibXML
+
+    ROUTES = [
+      [["/stream:features", "stream:http://etherx.jabber.org/streams"], AuthHandler],
+      ["/iq"      , DefaultIqHandler],
+      ["/message" , DefaultMessageHandler],
+      ["/presence", DefaultPresenceHandler],
+    ]
 
     def initialize(user, pass, opts = {})
       @user = user
@@ -175,6 +237,11 @@ module XMPP4EM
       @opts = { :auto_register => false }.merge(opts)
     end
     attr_reader :connection, :user
+    attr_writer :jid
+
+    def authenticated?
+      @authenticated == true
+    end
 
     def jid
       @jid ||= if @user.kind_of?(Jabber::JID)
@@ -248,47 +315,24 @@ module XMPP4EM
         return
       end
 
-      case stanza.name
-      when 'stream:features'
-        unless @authenticated
-          login do |res|
-            # log ['login response', res].inspect
-            if res == :failure and @opts[:auto_register]
-              register do |res|
-                #p ['register response', res]
-                login unless res == :error
-              end
-            end
-          end
+      # re-parsing is necessary for some reason in order for XPath queries
+      # like "/stream:features" to work
+      begin
+        doc = XML::Parser.document(stanza.doc).parse
 
-        else
-          if @connection.stream_features.has_key? 'bind'
-            iq = iq(:set)
-            bind = iq.child_add(XML::Node.new("bind"))
-            XML::Namespace.new(bind, nil, @connection.stream_features['bind'])
-
-            send(iq){ |reply|
-              if reply.attributes["type"] == "result" and jid = reply.find_first('//jid') and jid.content
-                p ['new jid is', jid.content].inspect
-                @jid = Jabber::JID.new(jid.content)
-              end
-            }
-          end
-
-          if @connection.stream_features.has_key? 'session'
-            iq = iq(:set)
-            session = iq.child_add(XML::Node.new("session"))
-            XML::Namespace.new(session, nil, @connection.stream_features['session'])
-
-            send(iq){ |reply|
-              if reply.attributes["type"] == "result"
-
-                on(:login, stanza)
-              end
-            }
+        # TODO compile XPath expressions
+        ROUTES.each do |xpath, blk|
+          doc.find(*xpath).each do |node|
+            blk.call(node, self)
           end
         end
+      rescue XML::Error => e
+        puts e.to_s
+        puts "If you included a prefix, make sure it's registered with the XPath parser"
+        puts stanza.to_s
+      end
 
+      case stanza.name
       when 'success', 'failure'
         if stanza.name == 'success'
           @authenticated = true
@@ -298,15 +342,6 @@ module XMPP4EM
 
         @auth_callback.call(stanza.name.to_sym) if @auth_callback
         return
-
-      when 'message'
-        on(:message, stanza)
-
-      when 'iq'
-        on(:iq, stanza)
-
-      when 'presence'
-        on(:presence, stanza)
       end
     end
 
@@ -325,7 +360,8 @@ module XMPP4EM
     def add_iq_callback       (&blk) on :iq,        &blk end
     def on_exception          (&blk) on :exception, &blk end
 
-  protected
+
+    ## TODO put these in a helper module
 
     def generate_id
       @last_id ||= 0
