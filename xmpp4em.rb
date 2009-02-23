@@ -45,6 +45,17 @@ module XMPP4EM
       end
 
       if @current_node.nil?
+        # copy namespaces onto the current node
+        if @stream_namespaces && !node.namespaces.default
+          XML::Namespace.new(node, nil, @stream_namespaces.default.href)
+
+          @stream_namespaces.each do |ns|
+            if ns.prefix && !node.namespaces.find_by_href(ns.href)
+              XML::Namespace.new(node, ns.prefix, ns.href)
+            end
+          end
+        end
+
         @current_node = node
         # assign the node to a document so XPath works
         XML::Document.new.root = @current_node
@@ -53,6 +64,7 @@ module XMPP4EM
       end
 
       if @current_node.name == 'stream:stream' and not @started
+        @stream_namespaces = @current_node.namespaces
         @started = true
         process
         @current_node = nil
@@ -73,7 +85,7 @@ module XMPP4EM
     end
 
     def characters(text)
-      @current_node.content += text if @current_node
+      @current_node << XML::Node.new_text(text) if @current_node
     end
 
     def error(*args)
@@ -343,6 +355,8 @@ module XMPP4EM
       XML::Namespace.new(presence, nil, "jabber:client")
       XML::Attr.nil(presence, "to", to.to_s) if to
       presence << XML::Node.new("status", status.to_s) if status
+
+      presence
     end
   end
 end
